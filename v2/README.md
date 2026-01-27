@@ -1,232 +1,111 @@
-# Fast-dLLM v2: Efficient Block-Diffusion Large Language Model
+# Fast-dLLM v2 — Compute Skipping Extensions (Evaluation Only)
 
-[![Project](https://img.shields.io/static/v1?label=Project&message=Github&color=blue&logo=github-pages)](https://nvlabs.github.io/Fast-dLLM/v2)
-[![arXiv](https://img.shields.io/badge/Paper-arXiv-red.svg)](https://arxiv.org/abs/2509.26328)
-[![Model](https://img.shields.io/badge/🤗-Model-yellow)](https://huggingface.co/Efficient-Large-Model/Fast_dLLM_v2_7B)
+This repository is a public fork of **Fast-dLLM v2** that adds and evaluates **compute-skipping policies at inference time**, without modifying the original training procedure.
 
-Fast-dLLM v2 is a carefully designed block diffusion language model (dLLM) that efficiently adapts pretrained autoregressive (AR) models into dLLMs for parallel text generation, requiring only approximately 1B tokens of fine-tuning. This represents a **500x reduction** in training data compared to full-attention diffusion LLMs while preserving the original model's performance.
+The original Fast-dLLM v2 project and full documentation are available here:  
+https://github.com/NVlabs/Fast-dLLM/tree/main/v2
 
-## 🎬 Demo
-https://github.com/user-attachments/assets/f2e055f5-3a44-41ca-9ef8-c84cf3ac2951
+This README focuses **only on evaluation**, and documents the added methods, files, and entry points.
 
-## 🎯 Key Features
+---
 
-### 1. **Block Diffusion Mechanism**
-- Novel training recipe combining block diffusion with complementary attention masks
-- Enables blockwise bidirectional context modeling 
-- Token shift mechanism to retain autoregressive characteristics
+## Goal
 
-<div align="center">
-  <img src="asset/training_recipe.png" alt="Training Recipe" width="700"/>
-  <p><em>Block-wise causal attention mask and complementary training strategy</em></p>
-</div>
+On top of the Fast-dLLM v2 codebase, implement and evaluate two cosine-similarity–based compute-skipping policies:
 
-### 2. **Hierarchical Caching System**
-- **Block-level cache**: Stores historical context representations across blocks
-- **Sub-block cache**: Enables efficient parallel generation within partially decoded blocks
+1. **Token-level skipping across denoising steps**
+2. **Layer-level skipping within a denoising step**
 
-### 3. **Parallel Decoding Pipeline**
-- Achieves up to **2.5x speedup** over standard AR decoding
-- Real-time visualization of the denoising process
-- Maintains generation quality while delivering state-of-the-art efficiency
+Both methods aim to reduce inference FLOPs while preserving accuracy, and are evaluated using the same **LM-Eval** setup as the original Fast-dLLM v2 benchmarks.
 
-<div align="center">
-  <img src="asset/visualization_animation.gif" alt="Generation Process Visualization" width="700"/>
-  <p><em>Block-level autoregressive generation with sub-block parallelization</em></p>
-</div>
+---
 
-## 🚀 Performance
+## Installation
 
-### Throughput Comparison
-Fast-dLLM v2 significantly outperforms baselines in both efficiency and accuracy:
-- **2.54× higher throughput** than Qwen2.5-7B-Instruct
-- **5.2% accuracy improvement** over Fast-dLLM-LLaDA
+Follow **exactly the same installation steps as the original Fast-dLLM v2 repository**.
 
-<div align="center">
-  <img src="asset/throughput.png" alt="Throughput Comparison" width="700"/>
-  <p><em>Throughput and accuracy comparison across different model variants</em></p>
-</div>
+Please refer to the original README for environment setup, dependencies, and installation instructions:  
+https://github.com/NVlabs/Fast-dLLM/tree/main/v2
 
-### Benchmark Results
-Comprehensive evaluation across diverse tasks:
+No additional dependencies are required for the compute-skipping extensions.
 
-| Model Size | Model | HumanEval-Base | HumanEval-Plus| MBPP-Base | MBPP-Plus |  GSM8K | Math | IFEval | MMLU | GPQA | Average |
-|------------|-------|-----------|--|---|---|-------|------|--------|------|------|---------|
-| **1B-scale** | Fast-dLLM v2 (1.5B) | 43.9 | 40.2 | 50.0 | 41.3 | 62.0 | 38.1  | 47.0 | 55.1 | 27.7 | **45.0** |
-| **7B+ scale** | Fast-dLLM v2 (7B) | 63.4 | 58.5 | 63.0 | 52.3 | 83.7 | 61.6 | 61.4 | 66.6 | 31.9 | **60.3** |
+---
 
-<div align="center">
-  <img src="asset/benchmark_results.png" alt="Benchmark Results" width="800"/>
-  <p><em>Comprehensive benchmark comparison across diverse tasks</em></p>
-</div>
+## Compute-Skipping Methods
 
+### 1. Token-Level Skipping (Across Denoising Steps)
 
-## 🏋️ Training
+**Where it operates**
+- Across *adjacent denoising steps* within the same block
 
-### Environment Setup
-First, create and activate a conda environment:
+**Method**
+- For each token position, compute the cosine similarity between:
+  - The token hidden state at the current denoising step
+  - The token hidden state at the previous denoising step
+- If the cosine similarity exceeds a threshold (`cosine_threshold`):
+  - Skip recomputation of that token
+  - Reuse the previous step’s output
 
-```bash
-conda create -n lmflow python=3.9 -y
-conda activate lmflow
-conda install mpi4py
-```
+**Effect**
+- Reduces token-level computation during denoising
+- Avoids redundant updates once token representations stabilize
 
-### Installation
-Install the package in development mode:
+---
 
-```bash
-pip install -e .
-```
+### 2. Layer-Level Skipping (Within a Denoising Step)
 
-### Data Preparation
-Download the training data (e.g., Alpaca dataset):
+**Where it operates**
+- Between *adjacent transformer layers* inside a single denoising step
 
-```bash
-cd data
-bash download.sh alpaca
-```
+**Method**
+- For each layer, compute the cosine similarity between:
+  - The input hidden states to the current layer
+  - The input hidden states to the previous layer
+- If the similarity exceeds a threshold (`cosine_threshold`):
+  - Skip executing the current transformer layer
+  - Propagate the hidden states forward unchanged
 
-### Fine-tuning
-Run the fine-tuning script:
+**Effect**
+- Reduces depth-wise computation
+- Conditionally skips layers based on representation stability
 
-```bash
-bash train_scripts/finetune_alpaca.sh
-```
+---
 
-This will start the training process using the Alpaca dataset with the optimized block diffusion training recipe.
+## Added Files
 
-## 🎮 Quick Start
+The following files are added relative to the original Fast-dLLM v2 repository:
 
-### Interactive Chatbot
-Launch the Gradio-based web interface:
+### Token-Level Skipping
+- `token_skip_generation_functions.py`  
+  Implements token-level cosine similarity checks and token reuse during denoising.
+- `token_skip_eval.py`  
+  LM-Eval evaluation harness using token-level compute skipping.
 
-```bash
-python app.py
-```
+### Layer-Level Skipping
+- `layer_skip_generation_functions.py`  
+  Implements cosine-based layer skipping via transformer layer wrappers.
+- `layer_skip_eval.py`  
+  LM-Eval evaluation harness using layer-level compute skipping.
 
-This will start a web server at `http://localhost:10086` with:
-- Real-time conversation interface
-- Live visualization of the denoising process
-- Adjustable generation parameters (block size, temperature, threshold)
-- Performance metrics display
+Each evaluation file serves as an **independent entry point** and replaces `eval.py` for that specific policy.
 
-### Command Line Chat
-For a simple command-line interface:
+---
 
-```bash
-python run_chatbot.py
-```
+## Evaluation
 
-Commands:
-- Type your message and press Enter
-- `clear` - Clear conversation history
-- `exit` - Quit the chatbot
+Evaluation follows the same procedure as Fast-dLLM v2 and uses **LM-Eval**.
 
+Supported tasks include:
+- GSM8K
+- Minerva-Math
+- IFEval
+- MMLU
+- GPQA
 
-## 📊 Evaluation
+### Entry Points
 
-### Run Benchmark Evaluation
-Execute the evaluation script for comprehensive benchmarking:
+Instead of `eval.py`, use the policy-specific evaluation scripts:
 
-```bash
-bash eval_script.sh
-```
-
-This script evaluates the model on:
-- **MMLU**: Massive Multitask Language Understanding
-- **GPQA**: Graduate-level Google-Proof Q&A
-- **GSM8K**: Grade School Math 8K
-- **Minerva Math**: Mathematical reasoning
-- **IFEval**: Instruction following evaluation
-
-### Custom Evaluation
-For custom evaluation with specific parameters:
-
-```bash
-accelerate launch eval.py \
-    --tasks gsm8k \
-    --batch_size 32 \
-    --num_fewshot 0 \
-    --model fast_dllm_v2 \
-    --model_args model_path=Efficient-Large-Model/Fast_dLLM_v2_7B,threshold=0.9
-```
-
-## 🏗️ Architecture
-
-### Training Recipe
-- **Token Shift Mechanism**: Each masked token is predicted using the logit of its preceding token
-- **Block-wise Causal Attention**: Access to all clean tokens from previous blocks and noisy tokens within current block
-- **Complementary Masks**: Alternate masking patterns ensure every token position is learned
-
-### Generation Process
-1. **Block-level Generation**: Autoregressive at the block level
-2. **Sub-block Parallelization**: Parallel decoding within blocks for efficiency
-3. **Hierarchical Caching**: Block and sub-block level caching for speed optimization
-
-## 📁 File Structure
-
-```
-v2/
-├── app.py                    # Gradio web interface
-├── run_chatbot.py           # Command-line chatbot
-├── eval.py                  # Evaluation harness integration
-├── eval_script.sh           # Benchmark evaluation script
-├── generation_functions.py  # Core generation algorithms
-├── index.html              # Project webpage
-├── asset/                  # Visual assets
-│   ├── demo.mp4
-│   ├── benchmark_results.png
-│   ├── throughput.png
-│   ├── training_recipe.png
-│   └── visualization_animation.gif
-└── README.md               # This file
-```
-
-## 🎨 Visualization Features
-
-The web interface provides real-time visualization of:
-- **Denoising Process**: Watch tokens being unmasked in real-time
-- **Generation Progress**: Visual feedback of the generation pipeline
-- **Performance Metrics**: Live throughput and timing information
-- **Slow Motion Replay**: Detailed step-by-step visualization
-
-## 🔬 Technical Details
-
-### Model Architecture
-- Based on Qwen2.5 architecture with block diffusion modifications
-- 7B parameter model with efficient parallel decoding capabilities
-- Custom attention mechanisms for block-wise processing
-
-### Optimization Techniques
-- Block-level KV caching for reduced computation
-- Sub-block parallel processing for improved throughput
-- Confidence-aware token unmasking for quality preservation
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](../CONTRIBUTING.md) for details.
-
-## 📄 License
-
-This project is licensed under the Apache License 2.0. See the [LICENSE](../LICENSE) file for details.
-
-## 📚 Citation
-
-If you find this work useful, please cite our paper:
-
-```bibtex
-@misc{wu2025fastdllmv2efficientblockdiffusion,
-      title={Fast-dLLM v2: Efficient Block-Diffusion LLM}, 
-      author={Chengyue Wu and Hao Zhang and Shuchen Xue and Shizhe Diao and Yonggan Fu and Zhijian Liu and Pavlo Molchanov and Ping Luo and Song Han and Enze Xie},
-      year={2025},
-      eprint={2509.26328},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2509.26328}, 
-}
-```
-
-## 🙏 Acknowledgements
-
-We thank [Qwen2.5](https://github.com/QwenLM/Qwen2.5) for the base model architecture
+- **Token-level skipping**
+  ```bash
+  accelerate launch token_skip_eval.py ...
