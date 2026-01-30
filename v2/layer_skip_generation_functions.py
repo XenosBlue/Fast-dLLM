@@ -1,3 +1,7 @@
+
+Folder highlights
+Code and logs detail evaluation runs for the Fast-dLLM v2 model across various tasks like GSM8K and IFEval, referencing layer skipping strategies.
+
 from typing import Callable, Optional, Union
 import torch
 import torch.nn.functional as F
@@ -14,24 +18,16 @@ TOKEN_COLOR = -0.5
 class Fast_dLLM_QwenForCausalLM:
 
     @torch.no_grad()
-    def sample_with_top_p(self, logits, top_p, temperature):
-        if temperature > 0:
-            probs = torch.softmax(logits / temperature, dim=-1)
-            probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-            probs_sum = torch.cumsum(probs_sort, dim=-1)
-            mask = probs_sum - probs_sort > top_p
-            probs_sort[mask] = 0.0
-            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-            next_token = torch.multinomial(probs_sort, num_samples=1)
-            next_token = torch.gather(probs_idx, -1, next_token)
-            return next_token, probs
-        else:
-            return logits.argmax(dim=-1), torch.softmax(logits, dim=-1)
-
-    @torch.no_grad()
     def batch_sample(self, input_ids, tokenizer, block_size, max_new_tokens, small_block_size, min_len, seq_len, mask_id=151665, threshold=0.95, stop_token=151645, use_block_cache=False, top_p=0.95, temperature=0.0):
         self._skip_return_tuple = True
         self._skip_layer_enabled = False
+        
+        if hasattr(self, 'layer_skip_state'):
+            self.layer_skip_state['prev_input'] = None
+            self.layer_skip_state['total_flops'] = 0.0
+        else:
+            self.layer_skip_state = {'prev_input': None, 'total_flops': 0.0}
+
         
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
@@ -59,7 +55,7 @@ class Fast_dLLM_QwenForCausalLM:
         num_small_blocks = block_size // small_block_size
         
         if hasattr(self, 'layer_skip_state'):
-             self.layer_skip_state['total_flops'] = 0.0
+             self.layer_skip_state['prev_input'] = None
 
         sample_indices = torch.arange(batch_size, device=self.device)
         finished_samples = {}
@@ -96,6 +92,7 @@ class Fast_dLLM_QwenForCausalLM:
                     next_token[finished_flag] = tokenizer.pad_token_id
                     x_t = torch.cat([x_t, next_token], dim=1)
                     step += 1
+
                     break
                 
                 for small_block_idx in range(num_small_blocks):
@@ -103,29 +100,36 @@ class Fast_dLLM_QwenForCausalLM:
                     small_block_end_idx = small_block_start_idx + small_block_size
                     start = -block_size + small_block_start_idx
                     end = None if block_size == small_block_end_idx else -block_size + small_block_end_idx
+                    
                     while True:
                         mask_idx = (x_t[:, -block_size:] == mask_id)
-                        if mask_idx[:, start:end].sum() == 0: break
+                        mask_idx_slice = mask_idx[:, start:end]
+                        if mask_idx_slice.sum() == 0:
+                            break
                         
                         if use_block_cache:
-                            self._skip_return_tuple = True
-                            self._skip_layer_enabled = False 
-                            if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
-                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
+                            if block_past_key_values is None or (x_t[:, -block_size + small_block_start_idx] == mask_id).any():
+                                self._skip_return_tuple = True
+                                self._skip_layer_enabled = False
+                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, block_size=block_size, use_block_cache=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                                 logits = logits[:, start:end]
                             else:
-                                logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
+                                self._skip_return_tuple = True
+                                self._skip_layer_enabled = False
+                                output = self.forward(input_ids=x_t[:, start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, block_size=block_size, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx)
+                                logits = output.logits
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                         else:
-                            self._skip_return_tuple = False 
-                            self._skip_layer_enabled = True 
-                            logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                            self._skip_return_tuple = False
+                            self._skip_layer_enabled = True
+                            output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, block_size=block_size)
+                            logits = output.logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                             logits = logits[:, start:end]
-                            
-                        x_1, p_1t = self.sample_with_top_p(logits, top_p=top_p, temperature=temperature)
+                        p_1t = torch.softmax(logits, dim=-1)
+                        x_1 = torch.argmax(p_1t, dim=-1)
                         x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
                         x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
                         unmask_idx = (x1_p > threshold)
@@ -212,32 +216,41 @@ class SkippingLayerWrapper(torch.nn.Module):
         should_skip = False
         if skipping_enabled and state['prev_input'] is not None:
             cos_sim = F.cosine_similarity(hidden_states.float(), state['prev_input'].float(), dim=-1).mean()
-            if cos_sim > self.threshold: should_skip = True
-
+            if cos_sim > self.threshold:
+                should_skip = True
         state['prev_input'] = hidden_states.detach()
 
         if should_skip:
-            if should_return_tuple: return (hidden_states, None) 
-            return hidden_states 
-        else:
-            batch_tokens = hidden_states.numel() / hidden_states.shape[-1]
-            state['total_flops'] += batch_tokens * self.layer_flops_per_token
-            
-            outputs = self.original_layer(hidden_states, *args, **kwargs)
-            if not should_return_tuple and isinstance(outputs, tuple): return outputs[0]
-            return outputs
+            if should_return_tuple:
+                return (hidden_states, None)
+            return hidden_states
+        
+        batch_tokens = hidden_states.numel() / hidden_states.shape[-1]
+        state['total_flops'] += batch_tokens * self.layer_flops_per_token
+        
+        outputs = self.original_layer(hidden_states, *args, **kwargs)
+        if not should_return_tuple and isinstance(outputs, tuple): return outputs[0]
+        return outputs
 
 def apply_layer_skipping(model, cosine_threshold=0.98):
-    if hasattr(model, "model") and hasattr(model.model, "layers"): layers = model.model.layers
-    elif hasattr(model, "layers"): layers = model.layers
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"): layers = model.transformer.h
-    else: return
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    else:
+        raise ValueError("Could not find transformer layers at model.model.layers")
 
-    for i, layer in enumerate(layers):
-        if not isinstance(layer, SkippingLayerWrapper):
-            layers[i] = SkippingLayerWrapper(layer, i, model, cosine_threshold)
-    print(f"Applied layer skipping with threshold {cosine_threshold}")
+    if not hasattr(model, "layer_skip_state"):
+        model.layer_skip_state = {"prev_input": None, "total_flops": 0.0}
+    else:
+        model.layer_skip_state["prev_input"] = None
+        model.layer_skip_state["total_flops"] = 0.0
 
-def setup_model_with_custom_generation(model):
-    model.mdm_sample_with_visualization = types.MethodType(Fast_dLLM_QwenForCausalLM.mdm_sample_with_visualization, model)
+    for idx, layer in enumerate(layers):
+        if isinstance(layer, SkippingLayerWrapper):
+            layers[idx] = SkippingLayerWrapper(layer.original_layer, idx, model, cosine_threshold)
+        else:
+            layers[idx] = SkippingLayerWrapper(layer, idx, model, cosine_threshold)
+
+def setup_model_with_custom_generation(model, custom_generation_fn: Optional[Callable]=None):
+    if custom_generation_fn is not None:
+        model.batch_sample = types.MethodType(custom_generation_fn, model)
     return model
