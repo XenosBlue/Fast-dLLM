@@ -1,5 +1,4 @@
 from typing import Callable, Optional, Union
-import json
 import torch
 import types
 from transformers.utils import auto_docstring, logging
@@ -26,20 +25,35 @@ class Fast_dLLM_QwenForCausalLM:
         seq_len,
         mask_id=151665,
         threshold=0.95,
-        similarity_threshold=0.95,
+        similarity_threshold=1.0,
         stop_token=151645,
         use_block_cache=False,
         top_p=0.95,
         temperature=0.0,
     ):
+        import torch.nn.functional as F
         flops_per_token = 2 * self.num_parameters()
         total_processed_tokens = 0
-        
+        total_forward_calls = 0
+        total_skipped_forward_calls = 0
+        skip_enabled = (similarity_threshold is not None) and (similarity_threshold < 1.0)
+
+        def _get_hidden(output):
+            hs = getattr(output, "hidden_states", None)
+            if hs is None:
+                return None
+            if isinstance(hs, (tuple, list)):
+                return hs[-1]
+            return hs
+
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
 
         if min_len > block_size:
-            output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
+            prefix = input_ids[:, :(min_len // block_size * block_size)]
+            total_processed_tokens += prefix.numel()
+            total_forward_calls += 1
+            output = self.forward(input_ids=prefix, use_cache=True, update_past_key_values=True, block_size=block_size)
             logits, past_key_values = output.logits, output.past_key_values
             if min_len % block_size == 0:
                 predict_sample_idx = (seq_len == min_len)
@@ -74,8 +88,7 @@ class Fast_dLLM_QwenForCausalLM:
             x_t = x_init.clone()
             step = 0
             block_past_key_values = None
-            
-            
+            prev_step_data = {}
             while True:
                 mask_idx = (x_t[:, -block_size:] == mask_id)
                 if mask_idx.sum() == 0:
@@ -85,8 +98,10 @@ class Fast_dLLM_QwenForCausalLM:
                             x_t[sample_idx, seq_len[sample_idx]+stop_token_idx+1:] = tokenizer.pad_token_id
                     if finished_flag.all():
                         break
-                    total_processed_tokens += x_t[:, -block_size:].numel()
-                    output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
+                    block_inp = x_t[:, -block_size:]
+                    total_processed_tokens += block_inp.numel()
+                    total_forward_calls += 1
+                    output = self.forward(input_ids=block_inp, use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
                     logits, past_key_values = output.logits, output.past_key_values
                     next_token = logits[:, -1:, :].argmax(dim=-1)
                     next_token[finished_flag] = tokenizer.pad_token_id
@@ -101,68 +116,90 @@ class Fast_dLLM_QwenForCausalLM:
 
                     start = -block_size + small_block_start_idx
                     end = None if block_size == small_block_end_idx else -block_size + small_block_end_idx
-                    
-                    prev_step_hidden = None
                     while True:
                         mask_idx = (x_t[:, -block_size:] == mask_id)
-                        if mask_idx[:, start:end].sum() == 0:
+                        mask_idx_slice = mask_idx[:, start:end]
+                        if mask_idx_slice.sum() == 0:
                             break
                         
+                        if skip_enabled and (small_block_idx in prev_step_data) and (len(prev_step_data[small_block_idx]) >= 2):
+                            prev_hidden_1, prev_tokens_1, prev_probs_1 = prev_step_data[small_block_idx][-1]
+                            prev_hidden_2 = prev_step_data[small_block_idx][-2][0]
+                            if prev_hidden_1 is not None and prev_hidden_2 is not None:
+                                cos = F.cosine_similarity(prev_hidden_2.float(), prev_hidden_1.float(), dim=-1)
+                                stable_mask = (cos > similarity_threshold) & mask_idx_slice
+                                if stable_mask.sum() == mask_idx_slice.sum() and mask_idx_slice.sum() > 0:
+                                    total_skipped_forward_calls += 1
+                                    x_1 = prev_tokens_1.clone()
+                                    x1_p = prev_probs_1.clone()
+                                    x1_p = torch.where(mask_idx_slice, x1_p, -torch.inf)
+
+                                    unmask_idx = (x1_p > threshold) | stable_mask
+                                    max_prob_idx = x1_p.argmax(dim=-1)
+                                    unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
+                                    unmask_idx = unmask_idx & mask_idx_slice
+
+                                    x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
+
+                                    finished_row_flags = ((x_1 == stop_token) & unmask_idx).any(dim=1)
+                                    finished_flag = finished_flag | finished_row_flags
+
+                                    step += 1
+                                    continue
+                        
+                        hidden_slice = None
                         if use_block_cache:
                             if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
-                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True,output_hidden_states=True)
-                                current_hidden = output.hidden_states[-1]
+                                block_inp = x_t[:, -block_size:]
+                                total_processed_tokens += block_inp.numel()
+                                total_forward_calls += 1
+                                output = self.forward(input_ids=block_inp, use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, output_hidden_states=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                                 logits = logits[:, start:end]
+                                hs = _get_hidden(output)
+                                if hs is not None:
+                                    hs = torch.cat([hs[:, :1, :], hs[:, :-1, :]], dim=1)
+                                    hidden_slice = hs[:, start:end]
                             else:
-                                outputs = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx,output_hidden_states=True)
-                                current_hidden = outputs.hidden_states[-1]
-                                logits = outputs.logits
+                                slice_inp = x_t[:, start:end]
+                                total_processed_tokens += slice_inp.numel()
+                                total_forward_calls += 1
+                                output = self.forward(input_ids=slice_inp, use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx, output_hidden_states=True)
+                                logits = output.logits
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                                hs = _get_hidden(output)
+                                if hs is not None:
+                                    hs = torch.cat([hs[:, :1, :], hs[:, :-1, :]], dim=1)
+                                    hidden_slice = hs
                         else:
-                            total_processed_tokens += x_t[:, -block_size:].numel()
-                            outputs = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False,output_hidden_states=True)
-                            current_hidden = outputs.hidden_states[-1]
-                            logits = outputs.logits
+                            block_inp = x_t[:, -block_size:]
+                            total_processed_tokens += block_inp.numel()
+                            total_forward_calls += 1
+                            output = self.forward(input_ids=block_inp, use_cache=True, past_key_values=past_key_values, update_past_key_values=False, output_hidden_states=True)
+                            logits = output.logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                             logits = logits[:, start:end]
-                        
-                        
-                        batch_dim = x_t.shape[0]
-                        expected_elements = batch_dim * block_size
-                        cos_skip = False
-                        if current_hidden.dim() == 3:
-                            if current_hidden.shape[1] == block_size:
-                                cos_skip = True
-                        elif current_hidden.dim() == 2:
-                            if current_hidden.shape[0] * current_hidden.shape[1] == expected_elements * current_hidden.shape[-1]:
-                                current_hidden = current_hidden.view(batch_dim, block_size, -1)
-                                cos_skip = True
-                            elif current_hidden.shape[0] == expected_elements:
-                                current_hidden = current_hidden.view(batch_dim, block_size, -1)
-                                cos_skip = True
-                         
-                        skip_mask = torch.zeros_like(mask_idx[:, start:end], dtype=torch.bool)
-                        if cos_skip:
-                            print("COS SKIP")
-                            current_hidden_slice = current_hidden[:, start:end, :]
-                            if prev_step_hidden is not None:
-                                cos_sim = torch.nn.functional.cosine_similarity(current_hidden_slice, prev_step_hidden, dim=-1)
-                                skip_mask = cos_sim > similarity_threshold
-                            prev_step_hidden = current_hidden_slice.detach()
-                        else:
-                            prev_step_hidden = None
-                        
-                        
+                            hs = _get_hidden(output)
+                            if hs is not None:
+                                hs = torch.cat([hs[:, :1, :], hs[:, :-1, :]], dim=1)
+                                hidden_slice = hs[:, start:end]
+
                         x_1, p_1t = self.sample_with_top_p(logits, top_p=top_p, temperature=temperature)
                         x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
-                        x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
+                        x1_p = torch.where(mask_idx_slice, x1_p, -torch.inf)
 
-                        unmask_idx = (x1_p > threshold) | skip_mask
+                        if hidden_slice is not None:
+                            if small_block_idx not in prev_step_data:
+                                prev_step_data[small_block_idx] = []
+                            prev_step_data[small_block_idx].append((hidden_slice.detach().clone(), x_1.detach().clone(), x1_p.detach().clone()))
+                            if len(prev_step_data[small_block_idx]) > 2:
+                                prev_step_data[small_block_idx].pop(0)
+
+                        unmask_idx = (x1_p > threshold)
                         max_prob_idx = x1_p.argmax(dim=-1)
                         unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
-                        unmask_idx = unmask_idx & mask_idx[:, start:end]
+                        unmask_idx = unmask_idx & mask_idx_slice
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
 
@@ -202,17 +239,16 @@ class Fast_dLLM_QwenForCausalLM:
 
 
 
-        
         if len(finished_samples) < batch_size:
             for sample_idx in range(x_t.shape[0]):
                 original_idx = sample_indices[sample_idx].item()
                 finished_samples[original_idx] = x_t[sample_idx:sample_idx+1].clone().squeeze(dim=0)
         
         assert len(finished_samples) == batch_size
-        
-        total_flops = total_processed_tokens * flops_per_token
-        print(f"[BENCHMARK] Batch Size: {input_ids.shape[0]} | "f"Total Tokens Processed: {total_processed_tokens} | "f"Est. TFLOPs: {total_flops}")
-        
+
+        total_flops = float(total_processed_tokens) * float(flops_per_token)
+        total_tflops = total_flops / 1e12
+        print(f"[BENCHMARK] Token-Skip Strategy | Total TFLOPs: {total_tflops} | Total Tokens Processed: {int(total_processed_tokens)} | Forward Calls: {int(total_forward_calls)} | Skipped Forwards: {int(total_skipped_forward_calls)}", flush=True)
         return finished_samples
 
     @torch.no_grad()
